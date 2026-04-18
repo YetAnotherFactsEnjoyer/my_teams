@@ -177,11 +177,12 @@ impl Server {
 
     fn send_event_to_user(&mut self, user_uuid: &str, msg: &str) {
         for client in self.clients.values_mut() {
-            if let Some(ref uuid) = client.uuid
-                && uuid == user_uuid
-            {
-                client.queue_message(msg);
-                break;
+            match client.uuid {
+                Some(ref uuid) if uuid == user_uuid => {
+                    client.queue_message(msg);
+                    break;
+                }
+                _ => continue,
             }
         }
     }
