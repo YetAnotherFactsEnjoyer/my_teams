@@ -10,7 +10,7 @@ use my_teams::ffi;
 
 use crate::{
     client::{Client, UseContext},
-    models::{Channel, Database, Message, Team, Thread, User, generate_uuid},
+    models::{generate_uuid, Channel, Database, Message, Team, Thread, User},
 };
 
 const MAX_NAME_LENGTH: usize = 32;
@@ -175,6 +175,38 @@ impl Server {
         self.clients.get(&addr)?.uuid.clone()
     }
 
+    fn is_subscribed_to_team(&self, user_uuid: &str, team_uuid: &str) -> bool {
+        self.db
+            .teams
+            .get(team_uuid)
+            .map(|team| team.subscribers.iter().any(|u| u == user_uuid))
+            .unwrap_or(false)
+    }
+
+    fn context_team_uuid(context: &UseContext) -> Option<&str> {
+        match context {
+            UseContext::Global => None,
+            UseContext::Team(team_uuid) => Some(team_uuid.as_str()),
+            UseContext::Channel(team_uuid, _) => Some(team_uuid.as_str()),
+            UseContext::Thread(team_uuid, _, _) => Some(team_uuid.as_str()),
+        }
+    }
+
+    fn reset_client_context_if_inside_team(&mut self, addr: SocketAddr, team_uuid: &str) {
+        if let Some(client) = self.clients.get_mut(&addr) {
+            let must_reset = match &client.use_context {
+                UseContext::Global => false,
+                UseContext::Team(current_team) => current_team == team_uuid,
+                UseContext::Channel(current_team, _) => current_team == team_uuid,
+                UseContext::Thread(current_team, _, _) => current_team == team_uuid,
+            };
+
+            if must_reset {
+                client.use_context = UseContext::Global;
+            }
+        }
+    }
+
     fn send_event_to_user(&mut self, user_uuid: &str, msg: &str) {
         for client in self.clients.values_mut() {
             match client.uuid {
@@ -245,6 +277,7 @@ impl Server {
                 }
             }
             client.uuid = None;
+            client.use_context = UseContext::Global;
             client.queue_message("200 Logout OK");
         }
     }
@@ -298,30 +331,110 @@ impl Server {
     }
 
     fn cmd_use(&mut self, addr: SocketAddr, args: &[String]) {
-        let client = match self.clients.get_mut(&addr) {
-            Some(c) => c,
-            None => return,
-        };
-
-        if client.uuid.is_none() {
-            client.queue_message("401 Unauthorized: Please login first");
-            return;
-        }
-
-        match args.len() {
-            1 => client.use_context = UseContext::Global,
-            2 => client.use_context = UseContext::Team(args[1].clone()),
-            3 => client.use_context = UseContext::Channel(args[1].clone(), args[2].clone()),
-            4 => {
-                client.use_context =
-                    UseContext::Thread(args[1].clone(), args[2].clone(), args[3].clone())
-            }
-            _ => {
-                client.queue_message("400 Bad Request: Invalid /use arguments");
+        let client_uuid = match self.get_client_uuid(addr) {
+            Some(uuid) => uuid,
+            None => {
+                self.send_to(addr, "401 Unauthorized: Please login first");
                 return;
             }
+        };
+
+        match args.len() {
+            1 => {
+                if let Some(client) = self.clients.get_mut(&addr) {
+                    client.use_context = UseContext::Global;
+                    client.queue_message("200 Context Updated");
+                }
+            }
+            2 => {
+                let team_uuid = &args[1];
+                let team = match self.db.teams.get(team_uuid) {
+                    Some(team) => team,
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Team");
+                        return;
+                    }
+                };
+
+                if !team.subscribers.iter().any(|u| u == &client_uuid) {
+                    self.send_to(addr, "401 Unauthorized: Not subscribed to team");
+                    return;
+                }
+
+                if let Some(client) = self.clients.get_mut(&addr) {
+                    client.use_context = UseContext::Team(team_uuid.clone());
+                    client.queue_message("200 Context Updated");
+                }
+            }
+            3 => {
+                let team_uuid = &args[1];
+                let channel_uuid = &args[2];
+
+                let team = match self.db.teams.get(team_uuid) {
+                    Some(team) => team,
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Team");
+                        return;
+                    }
+                };
+
+                if !team.subscribers.iter().any(|u| u == &client_uuid) {
+                    self.send_to(addr, "401 Unauthorized: Not subscribed to team");
+                    return;
+                }
+
+                if !team.channels.contains_key(channel_uuid) {
+                    self.send_to(addr, "404 Not Found: Unknown Channel");
+                    return;
+                }
+
+                if let Some(client) = self.clients.get_mut(&addr) {
+                    client.use_context = UseContext::Channel(team_uuid.clone(), channel_uuid.clone());
+                    client.queue_message("200 Context Updated");
+                }
+            }
+            4 => {
+                let team_uuid = &args[1];
+                let channel_uuid = &args[2];
+                let thread_uuid = &args[3];
+
+                let team = match self.db.teams.get(team_uuid) {
+                    Some(team) => team,
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Team");
+                        return;
+                    }
+                };
+
+                if !team.subscribers.iter().any(|u| u == &client_uuid) {
+                    self.send_to(addr, "401 Unauthorized: Not subscribed to team");
+                    return;
+                }
+
+                let channel = match team.channels.get(channel_uuid) {
+                    Some(channel) => channel,
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Channel");
+                        return;
+                    }
+                };
+
+                if !channel.threads.contains_key(thread_uuid) {
+                    self.send_to(addr, "404 Not Found: Unknown Thread");
+                    return;
+                }
+
+                if let Some(client) = self.clients.get_mut(&addr) {
+                    client.use_context = UseContext::Thread(
+                        team_uuid.clone(),
+                        channel_uuid.clone(),
+                        thread_uuid.clone(),
+                    );
+                    client.queue_message("200 Context Updated");
+                }
+            }
+            _ => self.send_to(addr, "400 Bad Request: Invalid /use arguments"),
         }
-        client.queue_message("200 Context Updated");
     }
 
     fn cmd_users(&mut self, addr: SocketAddr) {
@@ -340,10 +453,12 @@ impl Server {
 
     fn cmd_user(&mut self, addr: SocketAddr, args: &[String]) {
         if args.len() != 2 {
-            return self.send_to(addr, "400 Bad Request");
+            self.send_to(addr, "400 Bad Request");
+            return;
         }
         if self.get_client_uuid(addr).is_none() {
-            return self.send_to(addr, "401 Unauthorized");
+            self.send_to(addr, "401 Unauthorized");
+            return;
         }
 
         let target_uuid = &args[1];
@@ -361,16 +476,21 @@ impl Server {
 
     fn cmd_messages(&mut self, addr: SocketAddr, args: &[String]) {
         if args.len() != 2 {
-            return self.send_to(addr, "400 Bad Request");
+            self.send_to(addr, "400 Bad Request");
+            return;
         }
         let client_uuid = match self.get_client_uuid(addr) {
             Some(uuid) => uuid,
-            None => return self.send_to(addr, "401 Unauthorized"),
+            None => {
+                self.send_to(addr, "401 Unauthorized");
+                return;
+            }
         };
 
         let target_uuid = &args[1];
         if !self.db.users.contains_key(target_uuid) {
-            return self.send_to(addr, "404 Not Found: User not found");
+            self.send_to(addr, "404 Not Found: User not found");
+            return;
         }
 
         let mut response = String::from("200 MESSAGES");
@@ -389,16 +509,20 @@ impl Server {
 
     fn cmd_subscribe(&mut self, addr: SocketAddr, args: &[String]) {
         if args.len() != 2 {
-            return self.send_to(addr, "400 Bad Request");
+            self.send_to(addr, "400 Bad Request");
+            return;
         }
         let client_uuid = match self.get_client_uuid(addr) {
             Some(uuid) => uuid,
-            None => return self.send_to(addr, "401 Unauthorized"),
+            None => {
+                self.send_to(addr, "401 Unauthorized");
+                return;
+            }
         };
 
         let team_uuid = &args[1];
         if let Some(team) = self.db.teams.get_mut(team_uuid) {
-            if !team.subscribers.contains(&client_uuid) {
+            if !team.subscribers.iter().any(|u| u == &client_uuid) {
                 team.subscribers.push(client_uuid.clone());
             }
             ffi::call_user_subscribed(team_uuid, &client_uuid);
@@ -410,16 +534,28 @@ impl Server {
 
     fn cmd_unsubscribe(&mut self, addr: SocketAddr, args: &[String]) {
         if args.len() != 2 {
-            return self.send_to(addr, "400 Bad Request");
+            self.send_to(addr, "400 Bad Request");
+            return;
         }
+
         let client_uuid = match self.get_client_uuid(addr) {
             Some(uuid) => uuid,
-            None => return self.send_to(addr, "401 Unauthorized"),
+            None => {
+                self.send_to(addr, "401 Unauthorized");
+                return;
+            }
         };
 
         let team_uuid = &args[1];
         if let Some(team) = self.db.teams.get_mut(team_uuid) {
+            if !team.subscribers.iter().any(|u| u == &client_uuid) {
+                self.send_to(addr, "401 Unauthorized: Not subscribed to team");
+                return;
+            }
+
             team.subscribers.retain(|u| u != &client_uuid);
+            self.reset_client_context_if_inside_team(addr, team_uuid);
+
             ffi::call_user_unsubscribed(team_uuid, &client_uuid);
             self.send_to(addr, &format!("200 UNSUBSCRIBED|{client_uuid}|{team_uuid}"));
         } else {
@@ -443,20 +579,31 @@ impl Server {
 
         let context = client.use_context.clone();
 
+        if let Some(team_uuid) = Self::context_team_uuid(&context) {
+            if !self.is_subscribed_to_team(&client_uuid, team_uuid) {
+                self.send_to(addr, "401 Unauthorized: Not subscribed to team");
+                return;
+            }
+        }
+
         match context {
             UseContext::Global => {
                 if args.len() != 3 {
-                    return self.send_to(addr, "400 Bad Request");
+                    self.send_to(addr, "400 Bad Request");
+                    return;
                 }
+
                 let name = &args[1];
                 let desc = &args[2];
 
                 if name.len() > MAX_NAME_LENGTH || desc.len() > MAX_DESCRIPTION_LENGTH {
-                    return self.send_to(addr, "400 Bad Request: Length error");
+                    self.send_to(addr, "400 Bad Request: Length error");
+                    return;
                 }
 
                 if self.db.teams.values().any(|t| t.name == *name) {
-                    return self.send_to(addr, "409 Conflict: Team already exists");
+                    self.send_to(addr, "409 Conflict: Team already exists");
+                    return;
                 }
 
                 let new_uuid = generate_uuid();
@@ -474,19 +621,29 @@ impl Server {
             }
             UseContext::Team(team_uuid) => {
                 if args.len() != 3 {
-                    return self.send_to(addr, "400 Bad Request");
+                    self.send_to(addr, "400 Bad Request");
+                    return;
                 }
-
-                let team = match self.db.teams.get_mut(&team_uuid) {
-                    Some(t) => t,
-                    None => return self.send_to(addr, "404 Not Found: Team unknown"),
-                };
 
                 let name = &args[1];
                 let desc = &args[2];
 
+                if name.len() > MAX_NAME_LENGTH || desc.len() > MAX_DESCRIPTION_LENGTH {
+                    self.send_to(addr, "400 Bad Request: Length error");
+                    return;
+                }
+
+                let team = match self.db.teams.get_mut(&team_uuid) {
+                    Some(t) => t,
+                    None => {
+                        self.send_to(addr, "404 Not Found: Team unknown");
+                        return;
+                    }
+                };
+
                 if team.channels.values().any(|c| c.name == *name) {
-                    return self.send_to(addr, "409 Conflict: Channel already exists");
+                    self.send_to(addr, "409 Conflict: Channel already exists");
+                    return;
                 }
 
                 let new_uuid = generate_uuid();
@@ -506,22 +663,35 @@ impl Server {
             }
             UseContext::Channel(team_uuid, channel_uuid) => {
                 if args.len() != 3 {
-                    return self.send_to(addr, "400 Bad Request");
+                    self.send_to(addr, "400 Bad Request");
+                    return;
+                }
+
+                let title = &args[1];
+                let body = &args[2];
+
+                if title.len() > MAX_NAME_LENGTH || body.len() > MAX_BODY_LENGTH {
+                    self.send_to(addr, "400 Bad Request: Length error");
+                    return;
                 }
 
                 let team = match self.db.teams.get_mut(&team_uuid) {
                     Some(t) => t,
-                    None => return self.send_to(addr, "404 Not Found"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Team");
+                        return;
+                    }
                 };
+
                 let channel = match team.channels.get_mut(&channel_uuid) {
                     Some(c) => c,
-                    None => return self.send_to(addr, "404 Not Found"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Channel");
+                        return;
+                    }
                 };
 
-                let title = &args[1];
-                let body = &args[2];
                 let new_uuid = generate_uuid();
-
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -540,30 +710,46 @@ impl Server {
                 ffi::call_thread_created(&channel_uuid, &new_uuid, &client_uuid, title, body);
                 self.send_to(
                     addr,
-                    &format!("200 THREAD_CREATED|{new_uuid}|{client_uuid}|{timestamp}|{title}|{body}"),
-                );            }
+                    &format!(
+                        "200 THREAD_CREATED|{new_uuid}|{client_uuid}|{timestamp}|{title}|{body}"
+                    ),
+                );
+            }
             UseContext::Thread(team_uuid, channel_uuid, thread_uuid) => {
                 if args.len() != 2 {
-                    return self.send_to(addr, "400 Bad Request");
+                    self.send_to(addr, "400 Bad Request");
+                    return;
                 }
 
                 let reply = &args[1];
 
                 if reply.len() > MAX_BODY_LENGTH {
-                    return self.send_to(addr, "400 Bad Request: Reply too long");
+                    self.send_to(addr, "400 Bad Request: Reply too long");
+                    return;
                 }
 
                 let team = match self.db.teams.get_mut(&team_uuid) {
                     Some(t) => t,
-                    None => return self.send_to(addr, "404 Not Found"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Team");
+                        return;
+                    }
                 };
+
                 let channel = match team.channels.get_mut(&channel_uuid) {
                     Some(c) => c,
-                    None => return self.send_to(addr, "404 Not Found"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Channel");
+                        return;
+                    }
                 };
+
                 let thread = match channel.threads.get_mut(&thread_uuid) {
                     Some(t) => t,
-                    None => return self.send_to(addr, "404 Not Found"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Thread");
+                        return;
+                    }
                 };
 
                 let timestamp = std::time::SystemTime::now()
@@ -594,11 +780,22 @@ impl Server {
             None => return,
         };
 
-        if client.uuid.is_none() {
-            return self.send_to(addr, "401 Unauthorized: Please login first");
-        }
+        let client_uuid = match &client.uuid {
+            Some(uuid) => uuid.clone(),
+            None => {
+                self.send_to(addr, "401 Unauthorized: Please login first");
+                return;
+            }
+        };
 
         let context = client.use_context.clone();
+
+        if let Some(team_uuid) = Self::context_team_uuid(&context) {
+            if !self.is_subscribed_to_team(&client_uuid, team_uuid) {
+                self.send_to(addr, "401 Unauthorized: Not subscribed to team");
+                return;
+            }
+        }
 
         match context {
             UseContext::Global => {
@@ -614,8 +811,12 @@ impl Server {
             UseContext::Team(team_uuid) => {
                 let team = match self.db.teams.get(&team_uuid) {
                     Some(t) => t,
-                    None => return self.send_to(addr, "404 Not Found: Unknown Team"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Team");
+                        return;
+                    }
                 };
+
                 let mut response = String::from("200 LIST_CHANNELS");
                 for channel in team.channels.values() {
                     response.push_str(&format!(
@@ -628,11 +829,18 @@ impl Server {
             UseContext::Channel(team_uuid, channel_uuid) => {
                 let team = match self.db.teams.get(&team_uuid) {
                     Some(t) => t,
-                    None => return self.send_to(addr, "404 Not Found: Unknown Team"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Team");
+                        return;
+                    }
                 };
+
                 let channel = match team.channels.get(&channel_uuid) {
                     Some(c) => c,
-                    None => return self.send_to(addr, "404 Not Found: Unknown Channel"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Channel");
+                        return;
+                    }
                 };
 
                 let mut response = String::from("200 LIST_THREADS");
@@ -651,15 +859,26 @@ impl Server {
             UseContext::Thread(team_uuid, channel_uuid, thread_uuid) => {
                 let team = match self.db.teams.get(&team_uuid) {
                     Some(t) => t,
-                    None => return self.send_to(addr, "404 Not Found: Unknown Team"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Team");
+                        return;
+                    }
                 };
+
                 let channel = match team.channels.get(&channel_uuid) {
                     Some(c) => c,
-                    None => return self.send_to(addr, "404 Not Found: Unknown Channel"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Channel");
+                        return;
+                    }
                 };
+
                 let thread = match channel.threads.get(&thread_uuid) {
                     Some(t) => t,
-                    None => return self.send_to(addr, "404 Not Found: Unknown Thread"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Thread");
+                        return;
+                    }
                 };
 
                 let mut response = String::from("200 LIST_REPLIES");
@@ -682,10 +901,20 @@ impl Server {
 
         let client_uuid = match &client.uuid {
             Some(uuid) => uuid.clone(),
-            None => return self.send_to(addr, "401 Unauthorized"),
+            None => {
+                self.send_to(addr, "401 Unauthorized");
+                return;
+            }
         };
 
         let context = client.use_context.clone();
+
+        if let Some(team_uuid) = Self::context_team_uuid(&context) {
+            if !self.is_subscribed_to_team(&client_uuid, team_uuid) {
+                self.send_to(addr, "401 Unauthorized: Not subscribed to team");
+                return;
+            }
+        }
 
         match context {
             UseContext::Global => {
@@ -699,25 +928,34 @@ impl Server {
             UseContext::Team(team_uuid) => {
                 let team = match self.db.teams.get(&team_uuid) {
                     Some(t) => t,
-                    None => return self.send_to(addr, "404 Not Found: Unknown Team"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Team");
+                        return;
+                    }
                 };
+
                 self.send_to(
                     addr,
-                    &format!(
-                        "200 INFO_TEAM|{}|{}|{}",
-                        team.uuid, team.name, team.description
-                    ),
+                    &format!("200 INFO_TEAM|{}|{}|{}", team.uuid, team.name, team.description),
                 );
             }
             UseContext::Channel(team_uuid, channel_uuid) => {
                 let team = match self.db.teams.get(&team_uuid) {
                     Some(t) => t,
-                    None => return self.send_to(addr, "404 Not Found: Unknown Team"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Team");
+                        return;
+                    }
                 };
+
                 let channel = match team.channels.get(&channel_uuid) {
                     Some(c) => c,
-                    None => return self.send_to(addr, "404 Not Found: Unknown Channel"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Channel");
+                        return;
+                    }
                 };
+
                 self.send_to(
                     addr,
                     &format!(
@@ -729,16 +967,28 @@ impl Server {
             UseContext::Thread(team_uuid, channel_uuid, thread_uuid) => {
                 let team = match self.db.teams.get(&team_uuid) {
                     Some(t) => t,
-                    None => return self.send_to(addr, "404 Not Found: Unknown Team"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Team");
+                        return;
+                    }
                 };
+
                 let channel = match team.channels.get(&channel_uuid) {
                     Some(c) => c,
-                    None => return self.send_to(addr, "404 Not Found: Unknown Channel"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Channel");
+                        return;
+                    }
                 };
+
                 let thread = match channel.threads.get(&thread_uuid) {
                     Some(t) => t,
-                    None => return self.send_to(addr, "404 Not Found: Unknown Thread"),
+                    None => {
+                        self.send_to(addr, "404 Not Found: Unknown Thread");
+                        return;
+                    }
                 };
+
                 self.send_to(
                     addr,
                     &format!(
@@ -757,13 +1007,16 @@ impl Server {
     fn cmd_subscribed(&mut self, addr: SocketAddr, args: &[String]) {
         let client_uuid = match self.get_client_uuid(addr) {
             Some(uuid) => uuid,
-            None => return self.send_to(addr, "401 Unauthorized"),
+            None => {
+                self.send_to(addr, "401 Unauthorized");
+                return;
+            }
         };
 
         if args.len() == 1 {
             let mut response = String::from("200 SUBSCRIBED_TEAMS");
             for team in self.db.teams.values() {
-                if team.subscribers.contains(&client_uuid) {
+                if team.subscribers.iter().any(|u| u == &client_uuid) {
                     response.push_str(&format!(
                         "|{}:{}:{}",
                         team.uuid, team.name, team.description
@@ -775,8 +1028,16 @@ impl Server {
             let team_uuid = &args[1];
             let team = match self.db.teams.get(team_uuid) {
                 Some(t) => t,
-                None => return self.send_to(addr, "404 Not Found: Unknown Team"),
+                None => {
+                    self.send_to(addr, "404 Not Found: Unknown Team");
+                    return;
+                }
             };
+
+            if !team.subscribers.iter().any(|u| u == &client_uuid) {
+                self.send_to(addr, "401 Unauthorized: Not subscribed to team");
+                return;
+            }
 
             let mut response = String::from("200 SUBSCRIBED_USERS");
             for sub_uuid in &team.subscribers {
